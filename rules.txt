@@ -1,0 +1,4 @@
+RULES FUZZY
+Jika pH adalah basa DAN turbidity adalah rendah, THEN jumlah pakan SEDIKIT.
+Jika pH adalah netral DAN turbidity adalah tinggi, THEN jumlah pakan BANYAK.
+Jika pH adalah asam DAN turbidity adalah sedang, THEN jumlah pakan SEDANG.

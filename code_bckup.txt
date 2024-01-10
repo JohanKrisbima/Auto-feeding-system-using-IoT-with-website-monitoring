@@ -1,0 +1,357 @@
+#include <WiFi.h>
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <HTTPClient.h>
+
+String URL = "http://192.168.0.102/jaer/nilai_sensor.php";
+String URL2 = "http://192.168.0.102/jaer/histori.php";
+
+const char *ssid = "@wifi.id";
+const char *password = "shhgasghsv";
+
+RTC_DS3231 rtc;
+
+const int ph_pin = 34;
+const int turbidity_pin = 35;
+float po = 0;
+float pH_step;
+int nilai_analog_pH;
+int nilai_analog_turbidity;
+double teganganPH;
+float nilaiNTU;
+String kategori_pakan;
+
+// Kalibrasi
+float PH4 = 3.1;
+float PH7 = 2.6;
+
+float jumlah_pakan;
+
+
+
+#define SERVO_PIN 13   // Ganti dengan pin yang sesuai pada ESP32
+Servo myServo;
+
+#define WAIT_DURATION 120000  // Waktu tunggu setelah memberi pakan dalam milidetik (misalnya 120000 ms atau 2 menit)
+#define OPEN_DURATION 100
+#define OPEN_DURATION_BANYAK 5000  // Durasi buka servo untuk kategori_pakan "BANYAK" dalam milidetik
+#define OPEN_DURATION_SEDANG 2000  // Durasi buka servo untuk kategori_pakan "SEDANG" dalam milidetik
+#define OPEN_DURATION_SEDIKIT 1000  // Durasi buka servo untuk kategori_pakan "SEDIKIT" dalam milidetik
+
+unsigned long lastFeedTime = 0;  // Waktu terakhir memberi pakan
+bool isServoOpen = false;  // Status servo
+
+void setup() {
+  pinMode(ph_pin, INPUT);
+  pinMode(turbidity_pin, INPUT);
+  myServo.attach(SERVO_PIN);
+  Serial.begin(9600);
+  koneksiWiFi();
+
+  if (!rtc.begin()) {
+    Serial.println("Couldn't find RTC");
+    while (1);
+  }
+  if (rtc.lostPower()) {
+    Serial.println("RTC lost power, let's set the time!");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+}
+
+void loop() {
+  DateTime now = rtc.now();
+  nilai_analog_turbidity = analogRead(turbidity_pin);
+  float nilai_turbidity = turbidity();
+  nilai_analog_pH = analogRead(ph_pin);
+  ph(nilai_analog_pH);
+
+  // Logika Fuzzy Tsukamoto
+  float tingkat_pakan_sedikit = inferensiTsukamoto(pH_basa(), keanggotaan_turbidity_rendah());
+  float tingkat_pakan_banyak = inferensiTsukamoto(pH_netral(), keanggotaan_turbidity_tinggi());
+  float tingkat_pakan_sedang = inferensiTsukamoto(pH_asam(), keanggotaan_turbidity_sedang());
+
+  // Defuzzifikasi
+  jumlah_pakan = (tingkat_pakan_sedikit * 30 + tingkat_pakan_banyak * 90 + tingkat_pakan_sedang * 60) /
+                 (tingkat_pakan_sedikit + tingkat_pakan_banyak + tingkat_pakan_sedang);
+
+  // Periksa apakah sudah waktunya memberi pakan
+  if (now.hour() == 15 && now.minute() == 0) {
+    if (millis() - lastFeedTime > WAIT_DURATION) {
+      if (jumlah_pakan <= 40) {
+        kategori_pakan = "SEDIKIT";
+      } else if (jumlah_pakan > 40 && jumlah_pakan <= 70) {
+        kategori_pakan = "SEDANG";
+      } else {
+        kategori_pakan = "BANYAK";
+      }
+
+      if (!isServoOpen) {
+        openServo();  // Tunggu selama durasi buka servo
+
+        closeServo();
+        lastFeedTime = millis();  // Catat waktu terakhir memberi pakan
+        isServoOpen = false;  // Update status servo
+      }
+      sendKategoriPakan(kategori_pakan);
+    }
+  }
+
+  // Cetak hasil
+  Serial.println("=====OUTPUT FUZZY TSUKAMOTO=====");
+  Serial.print("Jumlah Pakan: ");
+  Serial.println(kategori_pakan);
+  Serial.println("===============================");
+  Serial.print(now.year(), DEC);
+  Serial.print('/');
+  Serial.print(now.month(), DEC);
+  Serial.print('/');
+  Serial.print(now.day(), DEC);
+  Serial.print(" ");
+  Serial.print(now.hour(), DEC);
+  Serial.print(':');
+  Serial.print(now.minute(), DEC);
+  Serial.print(':');
+  Serial.print(now.second(), DEC);
+  Serial.println();
+  Serial.println("===============================");
+  sendSensorDataToServer(nilai_turbidity, po);
+  delay(3000);
+}
+
+
+
+
+void koneksiWiFi() {
+  WiFi.mode(WIFI_OFF);
+  delay(1000);
+  WiFi.mode(WIFI_STA);
+
+  WiFi.begin(ssid, password);
+  Serial.println("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.print("Connected to : ");
+  Serial.println(ssid);
+  Serial.print("IP address : ");
+  Serial.println(WiFi.localIP());
+}
+
+void openServo() {
+  Serial.println("Opening Servo...");
+
+  if (kategori_pakan == "BANYAK") {
+    myServo.write(35);  // Posisi servo untuk kategori_pakan "BANYAK"
+    delay(OPEN_DURATION_BANYAK);  // Tunggu selama durasi buka servo untuk kategori_pakan "BANYAK"
+  } else if (kategori_pakan == "SEDANG") {
+    myServo.write(35);  // Posisi servo untuk kategori_pakan "SEDANG"
+    delay(OPEN_DURATION_SEDANG);  // Tunggu selama durasi buka servo untuk kategori_pakan "SEDANG"
+  } else {
+    myServo.write(35);  // Posisi servo untuk kategori_pakan "SEDIKIT"
+    delay(OPEN_DURATION_SEDIKIT);  // Tunggu selama durasi buka servo untuk kategori_pakan "SEDIKIT"
+  }
+
+  delay(500);  // Delay tambahan untuk memastikan servo stabil
+  Serial.println("Servo opened.");
+  isServoOpen = true;  // Update status servo
+
+  // Panggil fungsi closeServo() dengan durasi menutup yang berbeda
+  closeServo();
+}
+
+void closeServo() {
+  Serial.println("Closing Servo...");
+
+  // Sesuaikan posisi servo sesuai kebutuhan
+  myServo.write(0);  // Posisi servo untuk menutup
+
+  // Sesuaikan delay sesuai kebutuhan
+  delay(1000);  // Tunggu selama 1 detik (sesuaikan dengan kebutuhan)
+
+  Serial.println("Servo closed.");
+  isServoOpen = false;  // Update status servo
+}
+
+
+float turbidity() {
+  float nilaiNTU = konversiADCKeNTU(nilai_analog_turbidity);
+
+  Serial.println("====== TURBIDITY SENSOR ======");
+  Serial.print("Nilai Turbidity: ");
+  Serial.println(nilaiNTU);
+  tentukanKondisiAir(nilaiNTU);
+
+  return nilaiNTU;  // Tambahkan baris ini
+}
+
+
+float konversiADCKeNTU(int nilaiADC) {
+  float faktorKonversi = 0.1;
+  float offset = 0.0;
+   return (float)nilaiADC * faktorKonversi + offset;
+}
+
+
+void tentukanKondisiAir(float nilaiNTU) {
+   if (nilaiNTU < 50.0) {
+    Serial.println("Air sangat Keruh");
+  } else if (nilaiNTU < 150.0 && nilaiNTU > 50.0) {
+    Serial.println("Air cukup Keruh");
+  } else if (nilaiNTU < 180.0 && nilaiNTU > 100.0) {
+    Serial.println("Air agak Jernih");
+  } else {
+    Serial.println("Air sangat Jernih");
+  }
+}
+
+void kondisiPh(float po) {
+  if (po <= 5) {
+    Serial.println("PH ASAM");
+  } else if (po <= 8 && po > 5) {
+    Serial.println("PH NETRAL");
+  } else {
+    Serial.println("PH BASA");
+  }
+}
+
+void ph(int nilai_analog_pH) {
+  teganganPH = (3.3 / 4095.0) * nilai_analog_pH;
+
+  pH_step = (PH4 - PH7) / 3;
+  po = 5.00 - ((teganganPH - PH7) / pH_step);
+  Serial.println("=====PH SENSOR=====");
+  Serial.print("Nilai PH: ");
+  Serial.println(po, 2);
+  kondisiPh(po);
+  Serial.println("=========================");
+}
+
+// Fungsi Keanggotaan untuk pH
+float pH_basa() {
+  if (po <= 5) {
+    return 1.0;
+  } else if (po > 8) {
+    return 0.0;
+  } else {
+    return (8 - po) / 3;
+  }
+}
+
+float pH_asam() {
+  if (po <= 5) {
+    return 0.0;
+  } else if (po > 8) {
+    return 1.0;
+  } else {
+    return (po - 5) / 3;
+  }
+}
+
+float pH_netral() {
+  if (po <= 5 || po > 8) {
+    return 0.0;
+  } else if (po > 5 && po <= 6) {
+    return (po - 5);
+  } else {
+    return (8 - po);
+  }
+}
+
+// Fungsi Keanggotaan untuk turbidity
+
+float keanggotaan_turbidity_rendah() {
+  float nilaiNTU = konversiADCKeNTU(nilai_analog_turbidity);
+  if (nilaiNTU < 50) {
+    return 1.0;
+  } else {
+    return 0.0;
+  }
+}
+
+float keanggotaan_turbidity_tinggi() {
+  float nilaiNTU = konversiADCKeNTU(nilai_analog_turbidity);
+  if (nilaiNTU >= 150) {
+    return 1.0;
+  } else {
+    return 0.0;
+  }
+}
+
+float keanggotaan_turbidity_sedang() {
+  float nilaiNTU = konversiADCKeNTU(nilai_analog_turbidity);
+  if (nilaiNTU >= 50 && nilaiNTU < 150) {
+    return (nilaiNTU - 50) / 100;
+  } else {
+    return 0.0;
+  }
+}
+
+
+
+
+float inferensiTsukamoto(float keanggotaan_pH, float keanggotaan_turbidity) {
+  return fmin(keanggotaan_pH, keanggotaan_turbidity);
+}
+
+void sendSensorDataToServer(float turbidityValue, float pHValue) {
+  if (WiFi.status() != WL_CONNECTED) {
+    koneksiWiFi();
+  }
+
+  HTTPClient http;
+  http.begin(URL);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String postData = "turbidity=" + String(turbidityValue) + "&ph=" + String(pHValue);
+  int httpCode = http.POST(postData);
+
+  Serial.print("URL : "); Serial.println(URL);
+  Serial.print("Data : "); Serial.println(postData);
+  Serial.print("httpCode : "); Serial.println(httpCode);
+
+  if (httpCode > 0) {
+    String payload = http.getString();
+    Serial.print("payload : "); Serial.println(payload);
+  } else {
+    Serial.println("HTTP Request failed");
+  }
+
+  Serial.println("===================================================================");
+
+  http.end();
+  delay(500);  // Delay tambahan untuk memberikan waktu server untuk menanggapi
+}
+
+void sendKategoriPakan(String jml_pakan) {
+  if (WiFi.status() != WL_CONNECTED) {
+    koneksiWiFi();
+  }
+
+  HTTPClient http;
+  http.begin(URL2);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String postData = "jml_pakan=" + String(jml_pakan);  // Ubah kategori_pakan menjadi jml_pakan
+  int httpCode = http.POST(postData);
+
+  Serial.print("URL : "); Serial.println(URL2);
+  Serial.print("Data : "); Serial.println(postData);
+  Serial.print("httpCode : "); Serial.println(httpCode);
+
+  if (httpCode > 0) {
+    String payload = http.getString();
+    Serial.print("payload : "); Serial.println(payload);
+  } else {
+    Serial.println("HTTP Request failed");
+  }
+
+  Serial.println("===================================================================");
+
+  http.end();
+  delay(500);  // Delay tambahan untuk memberikan waktu server untuk menanggapi
+}
+
